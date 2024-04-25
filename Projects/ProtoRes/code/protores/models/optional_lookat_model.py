@@ -178,8 +178,9 @@ class OptionalLookAtModel(pl.LightningModule):
                                                       replacement=True)
 
             num_pos_effectors = (random_effector_types == 0).sum()
-            num_rot_effectors = (random_effector_types == 1).sum()
-            num_lookat_effectors = (random_effector_types == 2).sum()
+            num_speed_effectors = (random_effector_types == 1).sum()
+            num_rot_effectors = (random_effector_types == 2).sum()
+            num_lookat_effectors = (random_effector_types == 3).sum()
 
             # Forces a minimum number of position effector without shifting the expected number of position effectors
             # There are probably better ways to do this... This can also cause the actual number of effectors to be higher than expected
@@ -190,6 +191,7 @@ class OptionalLookAtModel(pl.LightningModule):
                 num_lookat_effectors = min((self.lookat_multinomial != 0).sum(), num_lookat_effectors)
         else:
             num_pos_effectors = len(self.validation_effectors)
+            num_speed_effectors = 0
             num_rot_effectors = 0
             num_lookat_effectors = 0
 
@@ -218,6 +220,32 @@ class OptionalLookAtModel(pl.LightningModule):
         input_data["position_weight"] = pos_effector_weights
         input_data["position_tolerance"] = pos_effector_tolerances
         input_data["position_id"] = pos_effector_ids
+        
+        # ====================
+        # SPEED EFFECTORS
+        # ====================
+        if not fixed_effector_setup:
+            speed_effector_ids = torch.multinomial(input=self.speed_multinomial.repeat(batch_size, 1),
+                                                 num_samples=num_speed_effectors, replacement=False).to(device)
+            speed_effector_tolerances = self.hparams.max_effector_noise_scale * torch.pow(
+                torch.rand(size=speed_effector_ids.shape).to(device), self.hparams.effector_noise_exp)
+        else:
+            speed_effector_ids = torch.multinomial(input=self.validation_multinomial_input.repeat(batch_size, 1),
+                                                 num_samples=num_speed_effectors, replacement=False).to(device)
+            speed_effector_tolerances = torch.zeros(size=speed_effector_ids.shape).to(device)
+        speed_effector_weights = torch.ones(size=speed_effector_ids.shape).to(
+            device)  # blending weights are always set to 1 during training
+        speed_effectors_in = torch.gather(batch["joint_speeds"], dim=1,
+                                        index=speed_effector_ids.unsqueeze(2).repeat(1, 1, 3))
+        if self.hparams.add_effector_noise:
+            speed_noise = speed_effector_tolerances.unsqueeze(2) * torch.randn((batch_size, num_speed_effectors, 3)).type_as(
+                speed_effectors_in)
+            speed_effectors_in = speed_effectors_in + speed_noise
+
+        input_data["speed_data"] = speed_effectors_in
+        input_data["speed_weight"] = speed_effector_weights
+        input_data["speed_tolerance"] = speed_effector_tolerances
+        input_data["speed_id"] = speed_effector_ids
 
         # ====================
         # ROTATIONAL EFFECTORS
@@ -302,6 +330,7 @@ class OptionalLookAtModel(pl.LightningModule):
         target_data = {
             "joint_positions": batch["joint_positions"],
             "root_joint_position": batch["joint_positions"][:, self.root_idx, :],
+            "joint_speeds": batch["joint_speeds"],
             "joint_rotations": joint_rotations,
             "joint_rotations_mat": joint_rotations_mat,
             "joint_world_rotations_mat": joint_world_rotations_mat
@@ -325,6 +354,17 @@ class OptionalLookAtModel(pl.LightningModule):
         effector_ids.append(input_data["position_id"])
         effector_types.append(torch.zeros_like(input_data["position_id"]))
         effector_weight.append(input_data["position_weight"])
+
+        # SPEEDS
+        speed_effectors_in = input_data["speed_data"]
+        speed_effectors_in = torch.cat([speed_effectors_in,
+                                      torch.zeros((speed_effectors_in.shape[0], speed_effectors_in.shape[1], 3)).type_as(
+                                          speed_effectors_in),
+                                      input_data["speed_tolerance"].unsqueeze(2)], dim=2)  # padding with zeros
+        effector_data.append(speed_effectors_in)
+        effector_ids.append(input_data["speed_id"])
+        effector_types.append(torch.zeros_like(input_data["speed_id"]))
+        effector_weight.append(input_data["speed_weight"])
 
         # ROTATIONS
         effector_data.append(
@@ -402,13 +442,15 @@ class OptionalLookAtModel(pl.LightningModule):
         effector_types = referenced_input_data["effector_type"]
         effector_weights = referenced_input_data["effector_weight"]
 
-        out_positions, out_rotations = self.net(effectors_in, effector_weights, effector_ids, effector_types)
+        out_positions, out_speeds, out_rotations = self.net(effectors_in, effector_weights, effector_ids, effector_types)
 
         joint_positions = out_positions.view(-1, self.skeleton.nb_joints, 3) + reference_pos
+        joint_speeds = out_speeds.view(-1, self.skeleton.nb_joints, 3)
         joint_rotations = out_rotations.view(-1, self.skeleton.nb_joints, 6)
 
         return {
             "joint_positions": joint_positions,
+            "joint_speeds": joint_speeds,
             "joint_rotations": joint_rotations,
             "root_joint_position": joint_positions[:, self.root_idx, :]
         }
@@ -424,13 +466,15 @@ class OptionalLookAtModel(pl.LightningModule):
         effector_types = packed_data["effector_type"]
         effector_weights = packed_data["effector_weight"]
 
-        out_positions, out_rotations = self.net(effectors_in, effector_weights, effector_ids, effector_types)
+        out_positions, out_speeds, out_rotations = self.net(effectors_in, effector_weights, effector_ids, effector_types)
 
         joint_positions = out_positions.view(-1, self.skeleton.nb_joints, 3) + reference_pos
+        joint_speeds = out_speeds.view(-1, self.skeleton.nb_joints, 3) + reference_pos
         joint_rotations = out_rotations.view(-1, self.skeleton.nb_joints, 6)
 
         return {
             "joint_positions": joint_positions,
+            "joint_speeds": joint_speeds,
             "joint_rotations": joint_rotations,
             "root_joint_position": joint_positions[:, self.root_idx, :]
         }
@@ -507,6 +551,10 @@ class OptionalLookAtModel(pl.LightningModule):
         in_position_ids = input_data["position_id"]
         in_position_tolerance = input_data["position_tolerance"]
 
+        in_speed_data = input_data["speed_data"]
+        in_speed_ids = input_data["speed_id"]
+        in_speed_tolerance = input_data["speed_tolerance"]
+
         in_rotation_data = input_data["rotation_data"]
         in_rotation_ids = input_data["rotation_id"]
         in_rotation_tolerance = input_data["rotation_tolerance"]
@@ -516,7 +564,9 @@ class OptionalLookAtModel(pl.LightningModule):
         in_lookat_tolerance = input_data["lookat_tolerance"]
 
         target_joint_positions = target_data["joint_positions"]
+        target_joint_speeds = target_data["joint_speeds"]
         target_root_joint_positions = target_data["root_joint_position"]
+        target_root_joint_speeds = target_data["root_joint_speed"]
         target_joint_rotations_mat = target_data["joint_rotations_mat"]
         target_joint_rotations_fk = target_data["joint_world_rotations_mat"]
 
@@ -548,6 +598,11 @@ class OptionalLookAtModel(pl.LightningModule):
                                              src=pos_effector_w.view(batch_size, -1))
         else:
             joint_positions_weights = torch.ones(predicted_joint_positions_fk.shape[0:2]).type_as(in_position_tolerance)
+
+        # ==================
+        # SPEED EFFECTORS
+        # ==================
+        # TODO: Deal with the speed data
 
         # ==================
         # ROTATION EFFECTORS
@@ -684,7 +739,7 @@ class OptionalLookAtModel(pl.LightningModule):
         target_joint_positions = target["joint_positions"]
         target_root_joint_position = target["root_joint_position"]
         target_joint_rotations = target["joint_rotations"]
-
+        
         predicted_root_joint_position = predicted["root_joint_position"]
         predicted_joint_rotations = predicted["joint_rotations"]
 
@@ -737,6 +792,11 @@ class OptionalLookAtModel(pl.LightningModule):
             'position_tolerance': {1: 'num_pos_effectors'},
             'position_id': {1: 'num_pos_effectors'},
 
+            'speed_data': {1: 'num_speed_effectors'},
+            'speed_weight': {1: 'num_speed_effectors'},
+            'speed_tolerance': {1: 'num_speed_effectors'},
+            'speed_id': {1: 'num_speed_effectors'},
+
             'rotation_data': {1: 'num_rot_effectors'},
             'rotation_weight': {1: 'num_rot_effectors'},
             'rotation_tolerance': {1: 'num_rot_effectors'},
@@ -756,6 +816,11 @@ class OptionalLookAtModel(pl.LightningModule):
             "position_weight": torch.zeros((1, num_effectors)),
             "position_tolerance": torch.zeros((1, num_effectors)),
             "position_id": torch.zeros((1, num_effectors), dtype=torch.int64),
+
+            "speed_data": torch.zeros((1, num_effectors, 3)),
+            "speed_weight": torch.zeros((1, num_effectors)),
+            "speed_tolerance": torch.zeros((1, num_effectors)),
+            "speed_id": torch.zeros((1, num_effectors), dtype=torch.int64),
 
             "rotation_data": torch.zeros((1, num_effectors, 6)),
             "rotation_weight": torch.zeros((1, num_effectors)),
@@ -803,6 +868,7 @@ class OptionalLookAtModelSingleStage(OptionalLookAtModel):
 
         return {
             "joint_positions": None,
+            "joint_speeds": None,
             "joint_rotations": joint_rotations,
             "root_joint_position": root_joint_position
         }
@@ -827,6 +893,7 @@ class OptionalLookAtModelSingleStage(OptionalLookAtModel):
 
         return {
             "joint_positions": None,
+            "joint_speeds": None,
             "joint_rotations": joint_rotations,
             "root_joint_position": root_joint_position
         }
